@@ -1,0 +1,231 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+import httpx
+import json
+
+from app.config import ENV, OLLAMA_URL, OLLAMA_MODEL, VLLM_URL, VLLM_MODEL
+
+app = FastAPI(
+    title="Blazel Inference",
+    description="LLM Inference Service - Ollama (local) or vLLM (prod)",
+    version="0.1.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+active_adapters: dict = {}
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    customer_id: Optional[str] = None
+    max_tokens: int = 500
+    temperature: float = 0.7
+
+class GenerateResponse(BaseModel):
+    text: str
+    model: str
+    customer_id: Optional[str] = None
+    backend: str
+
+class ReloadAdapterRequest(BaseModel):
+    customer_id: str
+    adapter_path: str
+
+SYSTEM_PROMPT = """You are an expert LinkedIn content writer. Write engaging, professional posts that:
+- Start with a strong hook
+- Use short paragraphs
+- Include a clear call-to-action
+- Are authentic and not overly salesy
+- Are between 150-300 words
+
+Write only the post content, no explanations."""
+
+
+def get_backend_info():
+    if ENV == "prod":
+        return {"backend": "vllm", "url": VLLM_URL, "model": VLLM_MODEL}
+    return {"backend": "ollama", "url": OLLAMA_URL, "model": OLLAMA_MODEL}
+
+
+@app.get("/")
+async def root():
+    info = get_backend_info()
+    return {
+        "status": "ok",
+        "service": "blazel-inference",
+        "env": ENV,
+        "backend": info["backend"],
+        "model": info["model"]
+    }
+
+
+@app.get("/health")
+async def health():
+    info = get_backend_info()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            if info["backend"] == "ollama":
+                response = await client.get(f"{info['url']}/api/tags")
+            else:
+                response = await client.get(f"{info['url']}/health")
+
+            if response.status_code == 200:
+                return {
+                    "status": "healthy",
+                    "backend": info["backend"],
+                    "model": info["model"]
+                }
+    except Exception as e:
+        return {"status": "unhealthy", "backend": info["backend"], "error": str(e)}
+    return {"status": "unhealthy", "backend": info["backend"]}
+
+
+async def generate_ollama(prompt: str, request: GenerateRequest) -> str:
+    """Generate using Ollama (local, quantized)"""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": request.temperature,
+                    "num_predict": request.max_tokens
+                }
+            }
+        )
+        response.raise_for_status()
+        return response.json().get("response", "")
+
+
+async def generate_vllm(prompt: str, request: GenerateRequest) -> str:
+    """Generate using vLLM (production, full 16-bit on GPU)"""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        # vLLM uses OpenAI-compatible API
+        response = await client.post(
+            f"{VLLM_URL}/v1/completions",
+            json={
+                "model": VLLM_MODEL,
+                "prompt": prompt,
+                "max_tokens": request.max_tokens,
+                "temperature": request.temperature,
+                "stop": ["\n\n\n"]
+            },
+            headers={"Content-Type": "application/json"}
+        )
+        response.raise_for_status()
+        result = response.json()
+        return result["choices"][0]["text"]
+
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate(request: GenerateRequest):
+    info = get_backend_info()
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{request.prompt}"
+
+    # Check for customer-specific adapter (production only)
+    adapter_loaded = False
+    if request.customer_id and request.customer_id in active_adapters:
+        adapter_loaded = True
+        # In production with vLLM, we'd use LoRAX or similar to load adapters
+        # For now, just note that an adapter is available
+
+    try:
+        if info["backend"] == "ollama":
+            generated_text = await generate_ollama(full_prompt, request)
+        else:
+            generated_text = await generate_vllm(full_prompt, request)
+
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Inference timeout")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"{info['backend']} unavailable: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+
+    return GenerateResponse(
+        text=generated_text.strip(),
+        model=info["model"],
+        customer_id=request.customer_id,
+        backend=info["backend"]
+    )
+
+
+@app.post("/reload-adapter")
+async def reload_adapter(request: ReloadAdapterRequest):
+    """
+    Register a LoRA adapter for a customer.
+    In production with vLLM, this would trigger hot-reload of LoRA weights.
+    """
+    active_adapters[request.customer_id] = request.adapter_path
+
+    info = get_backend_info()
+
+    if info["backend"] == "vllm":
+        # In production, we'd call vLLM's LoRA loading endpoint
+        # Example: POST /v1/load_lora with adapter_path
+        return {
+            "status": "ok",
+            "message": f"Adapter registered for {request.customer_id}",
+            "adapter_path": request.adapter_path,
+            "note": "Production: Would hot-reload LoRA into vLLM"
+        }
+    else:
+        return {
+            "status": "ok",
+            "message": f"Adapter registered for {request.customer_id}",
+            "note": "Local mode: Ollama doesn't support runtime LoRA loading"
+        }
+
+
+@app.get("/adapters")
+async def list_adapters():
+    return {"adapters": active_adapters, "env": ENV}
+
+
+@app.post("/generate-stream")
+async def generate_stream(request: GenerateRequest):
+    """Streaming generation (Ollama only for now)"""
+    from fastapi.responses import StreamingResponse
+
+    info = get_backend_info()
+
+    if info["backend"] != "ollama":
+        raise HTTPException(status_code=501, detail="Streaming only supported with Ollama backend")
+
+    full_prompt = f"{SYSTEM_PROMPT}\n\n{request.prompt}"
+
+    async def stream_generator():
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            async with client.stream(
+                "POST",
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "prompt": full_prompt,
+                    "stream": True,
+                    "options": {
+                        "temperature": request.temperature,
+                        "num_predict": request.max_tokens
+                    }
+                }
+            ) as response:
+                async for line in response.aiter_lines():
+                    if line:
+                        data = json.loads(line)
+                        if "response" in data:
+                            yield f"data: {json.dumps({'text': data['response']})}\n\n"
+                        if data.get("done"):
+                            yield f"data: {json.dumps({'done': True})}\n\n"
+                            break
+
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
