@@ -50,7 +50,7 @@ Write only the post content, no explanations."""
 
 
 def get_backend_info():
-    if ENV == "prod":
+    if ENV == "production":
         return {"backend": "vllm", "url": VLLM_URL, "model": VLLM_MODEL}
     return {"backend": "ollama", "url": OLLAMA_URL, "model": OLLAMA_MODEL}
 
@@ -110,27 +110,30 @@ async def generate_ollama(prompt: str, request: GenerateRequest) -> str:
 async def generate_vllm(prompt: str, request: GenerateRequest) -> str:
     """Generate using vLLM (production, full 16-bit on GPU)"""
     async with httpx.AsyncClient(timeout=120.0) as client:
-        # vLLM uses OpenAI-compatible API
+        # vLLM uses OpenAI-compatible chat API for Llama 3.1
         response = await client.post(
-            f"{VLLM_URL}/v1/completions",
+            f"{VLLM_URL}/v1/chat/completions",
             json={
                 "model": VLLM_MODEL,
-                "prompt": prompt,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": request.prompt}
+                ],
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature,
-                "stop": ["\n\n\n"]
+                "repetition_penalty": 1.1,
+                "stop": ["---", "Here are", "What's your"]
             },
             headers={"Content-Type": "application/json"}
         )
         response.raise_for_status()
         result = response.json()
-        return result["choices"][0]["text"]
+        return result["choices"][0]["message"]["content"]
 
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest):
     info = get_backend_info()
-    full_prompt = f"{SYSTEM_PROMPT}\n\n{request.prompt}"
 
     # Check for customer-specific adapter (production only)
     adapter_loaded = False
@@ -141,9 +144,12 @@ async def generate(request: GenerateRequest):
 
     try:
         if info["backend"] == "ollama":
+            # Ollama uses raw prompt with system prompt prepended
+            full_prompt = f"{SYSTEM_PROMPT}\n\n{request.prompt}"
             generated_text = await generate_ollama(full_prompt, request)
         else:
-            generated_text = await generate_vllm(full_prompt, request)
+            # vLLM uses chat format (system prompt handled in generate_vllm)
+            generated_text = await generate_vllm(request.prompt, request)
 
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Inference timeout")

@@ -1,0 +1,45 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: blazel-prod
+  ZONE: us-west1-a
+  VM_NAME: blazel-inference
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to VM
+        run: |
+          gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="
+            cd ~/blazel-inference
+
+            # Pull latest code
+            git pull origin main
+
+            # Restart FastAPI service
+            pkill -f 'uvicorn app.main:app' || true
+            sleep 2
+            nohup python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8001 > ~/fastapi.log 2>&1 &
+
+            echo 'Deployment complete'
+          "
+
+      - name: Verify deployment
+        run: |
+          sleep 5
+          gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="curl -s localhost:8001/"
