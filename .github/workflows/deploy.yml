@@ -27,7 +27,7 @@ jobs:
         run: |
           gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="
             cd ~/blazel-inference
-            git pull origin master
+            git pull origin main
             sudo systemctl restart blazel-fastapi
             echo 'Deployment complete'
           "
