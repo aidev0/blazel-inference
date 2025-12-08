@@ -17,6 +17,7 @@ HF_TOKEN=${HF_TOKEN} python3 -m vllm.entrypoints.openai.api_server \
     --host 0.0.0.0 \
     --enable-lora \
     --max-lora-rank 64 \
+    --max-model-len 8192 \
     --gpu-memory-utilization 0.9 &
 
 # Wait for vLLM to be ready
