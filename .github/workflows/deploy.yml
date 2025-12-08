@@ -6,37 +6,34 @@ on:
   workflow_dispatch:
 
 env:
-  PROJECT_ID: blazel-prod
-  ZONE: us-east1-b
-  VM_NAME: blazel-inference
+  VM_HOST: 35.229.82.124
+  VM_USER: jacobrafati
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@v2
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ env.VM_HOST }} >> ~/.ssh/known_hosts 2>/dev/null || true
 
       - name: Deploy to VM
         run: |
-          gcloud compute ssh jacobrafati@${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="
-            cd /home/jacobrafati/blazel-inference
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ env.VM_USER }}@${{ env.VM_HOST }} << 'EOF'
+            cd ~/blazel-inference
             git pull origin master
             pkill -f vllm || true
             pkill -f uvicorn || true
             sleep 2
-            nohup bash start.sh > /home/jacobrafati/blazel.log 2>&1 &
+            nohup bash start.sh > ~/blazel.log 2>&1 &
             echo 'Services starting in background'
-          "
+          EOF
 
       - name: Verify deployment
         run: |
-          # Wait for FastAPI to come up (vLLM takes longer but FastAPI starts first)
           sleep 30
-          gcloud compute ssh jacobrafati@${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="curl -s localhost:8001/ || echo 'FastAPI not ready yet - check /home/jacobrafati/blazel.log'"
+          ssh -o StrictHostKeyChecking=no ${{ env.VM_USER }}@${{ env.VM_HOST }} "curl -s localhost:8001/ || echo 'FastAPI not ready yet - check ~/blazel.log'"
