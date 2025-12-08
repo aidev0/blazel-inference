@@ -52,7 +52,7 @@ async def shutdown_db():
 
 async def get_active_adapter(customer_id: str) -> Optional[dict]:
     """Fetch the active adapter for a customer from MongoDB"""
-    if not db:
+    if db is None:
         return None
     try:
         adapter = await db.adapters.find_one({
