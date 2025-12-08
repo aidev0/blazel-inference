@@ -23,8 +23,8 @@ jobs:
             cd ~/blazel-inference
             git checkout -- .
             git pull origin master
-            pkill -f vllm || true
-            pkill -f uvicorn || true
+            # Kill any process using port 8001
+            fuser -k 8001/tcp 2>/dev/null || true
             sleep 2
             nohup bash start.sh > ~/blazel.log 2>&1 &
             echo 'Services starting in background'
