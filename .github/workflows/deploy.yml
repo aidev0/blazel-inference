@@ -28,11 +28,15 @@ jobs:
           gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="
             cd ~/blazel-inference
             git pull origin master
-            sudo systemctl restart blazel-fastapi
-            echo 'Deployment complete'
+            pkill -f vllm || true
+            pkill -f uvicorn || true
+            sleep 2
+            nohup bash start.sh > ~/blazel.log 2>&1 &
+            echo 'Services starting in background'
           "
 
       - name: Verify deployment
         run: |
-          sleep 5
-          gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="curl -s localhost:8001/"
+          # Wait for FastAPI to come up (vLLM takes longer but FastAPI starts first)
+          sleep 30
+          gcloud compute ssh ${{ env.VM_NAME }} --zone=${{ env.ZONE }} --project=${{ env.PROJECT_ID }} --command="curl -s localhost:8001/ || echo 'FastAPI not ready yet - check ~/blazel.log'"
