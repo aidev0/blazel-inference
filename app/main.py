@@ -105,8 +105,11 @@ def get_adapter_local_path(adapter: dict) -> Optional[str]:
     job_id = adapter.get("job_id")
     gcs_url = adapter.get("gcs_url", "")
 
-    # Local path for this adapter
-    local_path = f"{ADAPTERS_DIR}/{customer_id}/adapter"
+    # Local path for this adapter - use job_id if available
+    if job_id:
+        local_path = f"{ADAPTERS_DIR}/{customer_id}/adapter-{job_id}"
+    else:
+        local_path = f"{ADAPTERS_DIR}/{customer_id}/adapter"
 
     # If GCS path provided (starts with gs://), download if needed
     if gcs_url.startswith("gs://"):
@@ -116,7 +119,7 @@ def get_adapter_local_path(adapter: dict) -> Optional[str]:
 
     # Try constructing GCS path from bucket and customer/job
     if GCS_BUCKET and job_id:
-        gcs_path = f"gs://{GCS_BUCKET}/{customer_id}/adapter_{job_id}"
+        gcs_path = f"gs://{GCS_BUCKET}/{customer_id}/adapter-{job_id}"
         if download_adapter_from_gcs(gcs_path, local_path):
             return local_path
 
