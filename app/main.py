@@ -59,39 +59,8 @@ async def get_active_adapter(customer_id: str) -> Optional[dict]:
         return None
 
 
-# Cache of loaded adapters (adapter_name -> local_path)
-# Tracks which adapters have been loaded into vLLM
-loaded_adapters: dict = {}
-
 # Local adapters directory on the inference VM
 ADAPTERS_DIR = "/home/jacobrafati/adapters"
-
-
-async def load_adapter_into_vllm(adapter_name: str, adapter_path: str) -> bool:
-    """Load a LoRA adapter into vLLM via its API"""
-    if adapter_name in loaded_adapters:
-        print(f"[INFERENCE] Adapter {adapter_name} already loaded")
-        return True
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{VLLM_URL}/v1/load_lora_adapter",
-                json={
-                    "lora_name": adapter_name,
-                    "lora_path": adapter_path
-                }
-            )
-            if response.status_code == 200:
-                loaded_adapters[adapter_name] = adapter_path
-                print(f"[INFERENCE] Loaded adapter {adapter_name} from {adapter_path}")
-                return True
-            else:
-                print(f"[INFERENCE] Failed to load adapter: {response.text}")
-                return False
-    except Exception as e:
-        print(f"[INFERENCE] Error loading adapter into vLLM: {e}")
-        return False
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -104,10 +73,6 @@ class GenerateResponse(BaseModel):
     model: str
     customer_id: Optional[str] = None
     backend: str
-
-class ReloadAdapterRequest(BaseModel):
-    customer_id: str
-    adapter_path: str
 
 SYSTEM_PROMPT = """You are an expert LinkedIn content writer. Write engaging, professional posts that:
 - Start with a strong hook
@@ -177,16 +142,21 @@ async def generate_ollama(prompt: str, request: GenerateRequest) -> str:
         return response.json().get("response", "")
 
 
-async def generate_vllm(prompt: str, request: GenerateRequest, adapter_name: Optional[str] = None) -> str:
+async def generate_vllm(prompt: str, request: GenerateRequest, adapter_path: Optional[str] = None) -> str:
     """Generate using vLLM (production, full 16-bit on GPU)
 
-    If adapter_name is provided and vLLM was started with --enable-lora,
-    it will use the specified LoRA adapter for generation.
+    If adapter_path is provided, vLLM will use that LoRA adapter.
+    vLLM handles loading/caching automatically - just pass the path as "model".
     """
     async with httpx.AsyncClient(timeout=120.0) as client:
-        # Build request payload
+        # Use adapter path as model if provided, otherwise base model
+        model_to_use = adapter_path if adapter_path else VLLM_MODEL
+
+        if adapter_path:
+            print(f"[INFERENCE] Using LoRA adapter: {adapter_path}")
+
         payload = {
-            "model": VLLM_MODEL,
+            "model": model_to_use,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": request.prompt}
@@ -196,12 +166,6 @@ async def generate_vllm(prompt: str, request: GenerateRequest, adapter_name: Opt
             "repetition_penalty": 1.1,
             "stop": ["---", "Here are", "What's your"]
         }
-
-        # If adapter is available, tell vLLM to use it
-        # This requires vLLM to be started with --enable-lora and the adapter registered
-        if adapter_name:
-            payload["model"] = adapter_name  # vLLM uses adapter name as model when LoRA is enabled
-            print(f"[INFERENCE] Requesting generation with adapter: {adapter_name}")
 
         # vLLM uses OpenAI-compatible chat API for Llama 3.1
         response = await client.post(
@@ -219,24 +183,13 @@ async def generate(request: GenerateRequest):
     info = get_backend_info()
 
     # Look up active adapter from MongoDB for this customer
-    adapter = None
-    adapter_name = None
+    adapter_path = None
     if request.customer_id and info["backend"] == "vllm":
         adapter = await get_active_adapter(request.customer_id)
         if adapter and adapter.get("gcs_path"):
-            adapter_name = f"adapter-{request.customer_id}"
-            # Construct local adapter path from customer_id
+            # Construct local adapter path - vLLM loads it automatically
             adapter_path = f"{ADAPTERS_DIR}/{request.customer_id}/adapter"
-
-            # Auto-load adapter into vLLM if not already loaded
-            if adapter_name not in loaded_adapters:
-                print(f"[INFERENCE] Auto-loading adapter {adapter_name} for customer {request.customer_id}")
-                loaded = await load_adapter_into_vllm(adapter_name, adapter_path)
-                if not loaded:
-                    print(f"[INFERENCE] Failed to load adapter, falling back to base model")
-                    adapter_name = None
-            else:
-                print(f"[INFERENCE] Using cached adapter {adapter_name}")
+            print(f"[INFERENCE] Customer {request.customer_id} has active adapter at {adapter_path}")
 
     try:
         if info["backend"] == "ollama":
@@ -244,8 +197,8 @@ async def generate(request: GenerateRequest):
             full_prompt = f"{SYSTEM_PROMPT}\n\n{request.prompt}"
             generated_text = await generate_ollama(full_prompt, request)
         else:
-            # vLLM uses chat format (system prompt handled in generate_vllm)
-            generated_text = await generate_vllm(request.prompt, request, adapter_name=adapter_name)
+            # vLLM uses chat format - pass adapter_path directly (vLLM handles loading)
+            generated_text = await generate_vllm(request.prompt, request, adapter_path=adapter_path)
 
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Inference timeout")
@@ -260,66 +213,6 @@ async def generate(request: GenerateRequest):
         customer_id=request.customer_id,
         backend=info["backend"]
     )
-
-
-@app.post("/reload-adapter")
-async def reload_adapter(request: ReloadAdapterRequest):
-    """
-    Load a LoRA adapter into vLLM for a customer.
-    This actually calls vLLM's API to hot-load the adapter.
-    """
-    info = get_backend_info()
-    adapter_name = f"adapter-{request.customer_id}"
-
-    if info["backend"] == "vllm":
-        # Actually load the adapter into vLLM
-        success = await load_adapter_into_vllm(adapter_name, request.adapter_path)
-        if success:
-            return {
-                "status": "loaded",
-                "adapter_name": adapter_name,
-                "adapter_path": request.adapter_path,
-                "message": f"Adapter loaded into vLLM for {request.customer_id}"
-            }
-        else:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to load adapter into vLLM"
-            )
-    else:
-        return {
-            "status": "skipped",
-            "message": f"Local mode: Ollama doesn't support runtime LoRA loading"
-        }
-
-
-@app.post("/unload-adapter/{customer_id}")
-async def unload_adapter(customer_id: str):
-    """Unload a LoRA adapter from vLLM"""
-    adapter_name = f"adapter-{customer_id}"
-
-    if adapter_name not in loaded_adapters:
-        return {"status": "not_loaded", "message": f"Adapter {adapter_name} was not loaded"}
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{VLLM_URL}/v1/unload_lora_adapter",
-                json={"lora_name": adapter_name}
-            )
-            if response.status_code == 200:
-                del loaded_adapters[adapter_name]
-                return {"status": "unloaded", "adapter_name": adapter_name}
-            else:
-                raise HTTPException(status_code=500, detail=f"Failed to unload: {response.text}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/adapters")
-async def list_adapters():
-    """List all loaded adapters"""
-    return {"loaded_adapters": loaded_adapters, "env": ENV}
 
 
 @app.post("/generate-stream")
