@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Use absolute paths - this script may run from startup or SSH
-WORK_DIR="/home/jacobrafati/blazel-inference"
-cd "$WORK_DIR"
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 source .env 2>/dev/null || true
 
 # Set up Python environment for user-installed packages
-export PATH="/home/jacobrafati/.local/bin:$PATH"
-export PYTHONPATH="/home/jacobrafati/.local/lib/python3.10/site-packages:$PYTHONPATH"
+export PATH="$HOME/.local/bin:$PATH"
+export PYTHONPATH="$HOME/.local/lib/python3.10/site-packages:$PYTHONPATH"
 
 # Start vLLM server with LoRA support in background
 echo "Starting vLLM with LoRA support..."
@@ -27,5 +27,5 @@ done
 echo "vLLM is ready"
 
 # Start FastAPI inference service
-cd "$WORK_DIR"
+cd "$SCRIPT_DIR"
 python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8001
