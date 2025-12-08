@@ -7,7 +7,7 @@ on:
 
 env:
   PROJECT_ID: blazel-prod
-  ZONE: us-west1-a
+  ZONE: us-east1-b
   VM_NAME: blazel-inference
 
 jobs:
