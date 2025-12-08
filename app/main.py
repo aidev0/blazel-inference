@@ -59,8 +59,39 @@ async def get_active_adapter(customer_id: str) -> Optional[dict]:
         return None
 
 
-# Cache of loaded adapters (adapter_id -> local_path)
-active_adapters: dict = {}
+# Cache of loaded adapters (adapter_name -> local_path)
+# Tracks which adapters have been loaded into vLLM
+loaded_adapters: dict = {}
+
+# Local adapters directory on the inference VM
+ADAPTERS_DIR = "/home/jacobrafati/adapters"
+
+
+async def load_adapter_into_vllm(adapter_name: str, adapter_path: str) -> bool:
+    """Load a LoRA adapter into vLLM via its API"""
+    if adapter_name in loaded_adapters:
+        print(f"[INFERENCE] Adapter {adapter_name} already loaded")
+        return True
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{VLLM_URL}/v1/load_lora_adapter",
+                json={
+                    "lora_name": adapter_name,
+                    "lora_path": adapter_path
+                }
+            )
+            if response.status_code == 200:
+                loaded_adapters[adapter_name] = adapter_path
+                print(f"[INFERENCE] Loaded adapter {adapter_name} from {adapter_path}")
+                return True
+            else:
+                print(f"[INFERENCE] Failed to load adapter: {response.text}")
+                return False
+    except Exception as e:
+        print(f"[INFERENCE] Error loading adapter into vLLM: {e}")
+        return False
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -194,7 +225,18 @@ async def generate(request: GenerateRequest):
         adapter = await get_active_adapter(request.customer_id)
         if adapter and adapter.get("gcs_path"):
             adapter_name = f"adapter-{request.customer_id}"
-            print(f"[INFERENCE] Using adapter {adapter_name} for customer {request.customer_id}")
+            # Construct local adapter path from customer_id
+            adapter_path = f"{ADAPTERS_DIR}/{request.customer_id}/adapter"
+
+            # Auto-load adapter into vLLM if not already loaded
+            if adapter_name not in loaded_adapters:
+                print(f"[INFERENCE] Auto-loading adapter {adapter_name} for customer {request.customer_id}")
+                loaded = await load_adapter_into_vllm(adapter_name, adapter_path)
+                if not loaded:
+                    print(f"[INFERENCE] Failed to load adapter, falling back to base model")
+                    adapter_name = None
+            else:
+                print(f"[INFERENCE] Using cached adapter {adapter_name}")
 
     try:
         if info["backend"] == "ollama":
@@ -223,33 +265,61 @@ async def generate(request: GenerateRequest):
 @app.post("/reload-adapter")
 async def reload_adapter(request: ReloadAdapterRequest):
     """
-    Register a LoRA adapter for a customer.
-    In production with vLLM, this would trigger hot-reload of LoRA weights.
+    Load a LoRA adapter into vLLM for a customer.
+    This actually calls vLLM's API to hot-load the adapter.
     """
-    active_adapters[request.customer_id] = request.adapter_path
-
     info = get_backend_info()
+    adapter_name = f"adapter-{request.customer_id}"
 
     if info["backend"] == "vllm":
-        # In production, we'd call vLLM's LoRA loading endpoint
-        # Example: POST /v1/load_lora with adapter_path
-        return {
-            "status": "ok",
-            "message": f"Adapter registered for {request.customer_id}",
-            "adapter_path": request.adapter_path,
-            "note": "Production: Would hot-reload LoRA into vLLM"
-        }
+        # Actually load the adapter into vLLM
+        success = await load_adapter_into_vllm(adapter_name, request.adapter_path)
+        if success:
+            return {
+                "status": "loaded",
+                "adapter_name": adapter_name,
+                "adapter_path": request.adapter_path,
+                "message": f"Adapter loaded into vLLM for {request.customer_id}"
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to load adapter into vLLM"
+            )
     else:
         return {
-            "status": "ok",
-            "message": f"Adapter registered for {request.customer_id}",
-            "note": "Local mode: Ollama doesn't support runtime LoRA loading"
+            "status": "skipped",
+            "message": f"Local mode: Ollama doesn't support runtime LoRA loading"
         }
+
+
+@app.post("/unload-adapter/{customer_id}")
+async def unload_adapter(customer_id: str):
+    """Unload a LoRA adapter from vLLM"""
+    adapter_name = f"adapter-{customer_id}"
+
+    if adapter_name not in loaded_adapters:
+        return {"status": "not_loaded", "message": f"Adapter {adapter_name} was not loaded"}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{VLLM_URL}/v1/unload_lora_adapter",
+                json={"lora_name": adapter_name}
+            )
+            if response.status_code == 200:
+                del loaded_adapters[adapter_name]
+                return {"status": "unloaded", "adapter_name": adapter_name}
+            else:
+                raise HTTPException(status_code=500, detail=f"Failed to unload: {response.text}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/adapters")
 async def list_adapters():
-    return {"adapters": active_adapters, "env": ENV}
+    """List all loaded adapters"""
+    return {"loaded_adapters": loaded_adapters, "env": ENV}
 
 
 @app.post("/generate-stream")
