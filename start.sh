@@ -1,9 +1,13 @@
 #!/bin/bash
 
-# Load environment
-cd ~/blazel-inference
+# Use absolute paths - this script may run from startup or SSH
+WORK_DIR="/home/jacobrafati/blazel-inference"
+cd "$WORK_DIR"
 source .env 2>/dev/null || true
-export PATH=$PATH:/home/jacobrafati/.local/bin
+
+# Set up Python environment for user-installed packages
+export PATH="/home/jacobrafati/.local/bin:$PATH"
+export PYTHONPATH="/home/jacobrafati/.local/lib/python3.10/site-packages:$PYTHONPATH"
 
 # Start vLLM server with LoRA support in background
 echo "Starting vLLM with LoRA support..."
@@ -23,5 +27,5 @@ done
 echo "vLLM is ready"
 
 # Start FastAPI inference service
-cd ~/blazel-inference
+cd "$WORK_DIR"
 python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8001
