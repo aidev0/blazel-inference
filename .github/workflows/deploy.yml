@@ -21,6 +21,7 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 ${{ secrets.VM_USER }}@${{ secrets.VM_HOST }} << 'EOF'
             cd ~/blazel-inference
+            git checkout -- .
             git pull origin master
             pkill -f vllm || true
             pkill -f uvicorn || true

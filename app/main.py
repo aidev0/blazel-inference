@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from motor.motor_asyncio import AsyncIOMotorClient
 
-from app.config import ENV, OLLAMA_URL, OLLAMA_MODEL, VLLM_URL, VLLM_MODEL, MONGODB_URL, GCS_BUCKET
+from app.config import ENV, OLLAMA_URL, OLLAMA_MODEL, VLLM_URL, VLLM_MODEL, MONGODB_URL
 
 app = FastAPI(
     title="Blazel Inference",
@@ -100,34 +100,20 @@ def download_adapter_from_gcs(gcs_path: str, local_path: str) -> bool:
 
 
 def get_adapter_local_path(adapter: dict) -> Optional[str]:
-    """Get or download the adapter, return local path"""
-    customer_id = adapter.get("customer_id")
-    job_id = adapter.get("job_id")
+    """Get or download the adapter, return local path from adapter record"""
+    local_path = adapter.get("local_path")
     gcs_url = adapter.get("gcs_url", "")
 
-    # Local path for this adapter - use job_id if available
-    if job_id:
-        local_path = f"{ADAPTERS_DIR}/{customer_id}/adapter-{job_id}"
-    else:
-        local_path = f"{ADAPTERS_DIR}/{customer_id}/adapter"
-
-    # If GCS path provided (starts with gs://), download if needed
-    if gcs_url.startswith("gs://"):
-        if download_adapter_from_gcs(gcs_url, local_path):
-            return local_path
-        return None
-
-    # Try constructing GCS path from bucket and customer/job
-    if GCS_BUCKET and job_id:
-        gcs_path = f"gs://{GCS_BUCKET}/{customer_id}/adapter-{job_id}"
-        if download_adapter_from_gcs(gcs_path, local_path):
-            return local_path
-
-    # Check if local path exists
-    if Path(local_path).exists() and (Path(local_path) / "adapter_config.json").exists():
+    # Check if adapter already exists locally
+    if local_path and Path(local_path).exists() and (Path(local_path) / "adapter_config.json").exists():
         return local_path
 
-    print(f"[INFERENCE] No adapter found for customer {customer_id}")
+    # Download from GCS if we have the URL
+    if gcs_url.startswith("gs://") and local_path:
+        if download_adapter_from_gcs(gcs_url, local_path):
+            return local_path
+
+    print(f"[INFERENCE] No adapter found at {local_path}")
     return None
 
 
