@@ -4,8 +4,9 @@ from pydantic import BaseModel
 from typing import Optional
 import httpx
 import json
+from motor.motor_asyncio import AsyncIOMotorClient
 
-from app.config import ENV, OLLAMA_URL, OLLAMA_MODEL, VLLM_URL, VLLM_MODEL
+from app.config import ENV, OLLAMA_URL, OLLAMA_MODEL, VLLM_URL, VLLM_MODEL, MONGODB_URL, GCS_BUCKET
 
 app = FastAPI(
     title="Blazel Inference",
@@ -21,6 +22,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# MongoDB connection for fetching active adapters
+mongo_client = None
+db = None
+
+@app.on_event("startup")
+async def startup_db():
+    global mongo_client, db
+    if MONGODB_URL:
+        try:
+            mongo_client = AsyncIOMotorClient(MONGODB_URL)
+            db = mongo_client.blazel
+            print(f"[INFERENCE] Connected to MongoDB")
+        except Exception as e:
+            print(f"[INFERENCE] MongoDB connection failed: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_db():
+    global mongo_client
+    if mongo_client:
+        mongo_client.close()
+
+
+async def get_active_adapter(customer_id: str) -> Optional[dict]:
+    """Fetch the active adapter for a customer from MongoDB"""
+    if not db:
+        return None
+    try:
+        adapter = await db.adapters.find_one({
+            "customer_id": customer_id,
+            "is_active": True
+        })
+        return adapter
+    except Exception as e:
+        print(f"[INFERENCE] Error fetching adapter: {e}")
+        return None
+
+
+# Cache of loaded adapters (adapter_id -> local_path)
 active_adapters: dict = {}
 
 class GenerateRequest(BaseModel):
@@ -107,23 +146,36 @@ async def generate_ollama(prompt: str, request: GenerateRequest) -> str:
         return response.json().get("response", "")
 
 
-async def generate_vllm(prompt: str, request: GenerateRequest) -> str:
-    """Generate using vLLM (production, full 16-bit on GPU)"""
+async def generate_vllm(prompt: str, request: GenerateRequest, adapter_name: Optional[str] = None) -> str:
+    """Generate using vLLM (production, full 16-bit on GPU)
+
+    If adapter_name is provided and vLLM was started with --enable-lora,
+    it will use the specified LoRA adapter for generation.
+    """
     async with httpx.AsyncClient(timeout=120.0) as client:
+        # Build request payload
+        payload = {
+            "model": VLLM_MODEL,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": request.prompt}
+            ],
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "repetition_penalty": 1.1,
+            "stop": ["---", "Here are", "What's your"]
+        }
+
+        # If adapter is available, tell vLLM to use it
+        # This requires vLLM to be started with --enable-lora and the adapter registered
+        if adapter_name:
+            payload["model"] = adapter_name  # vLLM uses adapter name as model when LoRA is enabled
+            print(f"[INFERENCE] Requesting generation with adapter: {adapter_name}")
+
         # vLLM uses OpenAI-compatible chat API for Llama 3.1
         response = await client.post(
             f"{VLLM_URL}/v1/chat/completions",
-            json={
-                "model": VLLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": request.prompt}
-                ],
-                "max_tokens": request.max_tokens,
-                "temperature": request.temperature,
-                "repetition_penalty": 1.1,
-                "stop": ["---", "Here are", "What's your"]
-            },
+            json=payload,
             headers={"Content-Type": "application/json"}
         )
         response.raise_for_status()
@@ -135,12 +187,14 @@ async def generate_vllm(prompt: str, request: GenerateRequest) -> str:
 async def generate(request: GenerateRequest):
     info = get_backend_info()
 
-    # Check for customer-specific adapter (production only)
-    adapter_loaded = False
-    if request.customer_id and request.customer_id in active_adapters:
-        adapter_loaded = True
-        # In production with vLLM, we'd use LoRAX or similar to load adapters
-        # For now, just note that an adapter is available
+    # Look up active adapter from MongoDB for this customer
+    adapter = None
+    adapter_name = None
+    if request.customer_id and info["backend"] == "vllm":
+        adapter = await get_active_adapter(request.customer_id)
+        if adapter and adapter.get("gcs_path"):
+            adapter_name = f"adapter-{request.customer_id}"
+            print(f"[INFERENCE] Using adapter {adapter_name} for customer {request.customer_id}")
 
     try:
         if info["backend"] == "ollama":
@@ -149,7 +203,7 @@ async def generate(request: GenerateRequest):
             generated_text = await generate_ollama(full_prompt, request)
         else:
             # vLLM uses chat format (system prompt handled in generate_vllm)
-            generated_text = await generate_vllm(request.prompt, request)
+            generated_text = await generate_vllm(request.prompt, request, adapter_name=adapter_name)
 
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Inference timeout")
