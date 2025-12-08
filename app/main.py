@@ -17,6 +17,9 @@ app = FastAPI(
     version="0.1.0"
 )
 
+# Track which LoRA adapters are loaded in vLLM
+loaded_adapters: set = set()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -124,6 +127,37 @@ def get_adapter_local_path(adapter: dict) -> Optional[str]:
     print(f"[INFERENCE] No adapter found for customer {customer_id}")
     return None
 
+
+async def load_lora_adapter(adapter_name: str, adapter_path: str) -> bool:
+    """Dynamically load a LoRA adapter into vLLM using the /v1/load_lora_adapter endpoint"""
+    global loaded_adapters
+
+    # Skip if already loaded
+    if adapter_name in loaded_adapters:
+        print(f"[INFERENCE] Adapter {adapter_name} already loaded")
+        return True
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{VLLM_URL}/v1/load_lora_adapter",
+                json={
+                    "lora_name": adapter_name,
+                    "lora_path": adapter_path
+                }
+            )
+            if response.status_code == 200:
+                loaded_adapters.add(adapter_name)
+                print(f"[INFERENCE] Loaded LoRA adapter: {adapter_name} from {adapter_path}")
+                return True
+            else:
+                print(f"[INFERENCE] Failed to load adapter: {response.status_code} - {response.text}")
+                return False
+    except Exception as e:
+        print(f"[INFERENCE] Error loading adapter: {e}")
+        return False
+
+
 class GenerateRequest(BaseModel):
     prompt: str
     customer_id: Optional[str] = None
@@ -204,19 +238,25 @@ async def generate_ollama(prompt: str, request: GenerateRequest) -> str:
         return response.json().get("response", "")
 
 
-async def generate_vllm(prompt: str, request: GenerateRequest, adapter_path: Optional[str] = None) -> str:
+async def generate_vllm(prompt: str, request: GenerateRequest, adapter_path: Optional[str] = None, customer_id: Optional[str] = None) -> str:
     """Generate using vLLM (production, full 16-bit on GPU)
 
-    If adapter_path is provided, vLLM will use that LoRA adapter.
-    vLLM handles loading/caching automatically - just pass the path as "model".
+    If adapter_path is provided, dynamically loads the LoRA adapter into vLLM
+    and uses it for generation.
     """
+    model_to_use = VLLM_MODEL
+
+    # If adapter provided, load it dynamically and use its name
+    if adapter_path and customer_id:
+        adapter_name = f"adapter-{customer_id}"
+        loaded = await load_lora_adapter(adapter_name, adapter_path)
+        if loaded:
+            model_to_use = adapter_name
+            print(f"[INFERENCE] Using LoRA adapter: {adapter_name}")
+        else:
+            print(f"[INFERENCE] Failed to load adapter, falling back to base model")
+
     async with httpx.AsyncClient(timeout=120.0) as client:
-        # Use adapter path as model if provided, otherwise base model
-        model_to_use = adapter_path if adapter_path else VLLM_MODEL
-
-        if adapter_path:
-            print(f"[INFERENCE] Using LoRA adapter: {adapter_path}")
-
         payload = {
             "model": model_to_use,
             "messages": [
@@ -260,8 +300,8 @@ async def generate(request: GenerateRequest):
             full_prompt = f"{SYSTEM_PROMPT}\n\n{request.prompt}"
             generated_text = await generate_ollama(full_prompt, request)
         else:
-            # vLLM uses chat format - pass adapter_path directly (vLLM handles loading)
-            generated_text = await generate_vllm(request.prompt, request, adapter_path=adapter_path)
+            # vLLM uses chat format - load adapter dynamically if available
+            generated_text = await generate_vllm(request.prompt, request, adapter_path=adapter_path, customer_id=request.customer_id)
 
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Inference timeout")
