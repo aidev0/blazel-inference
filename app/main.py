@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from typing import Optional
 import httpx
 import json
+import os
+import subprocess
+from pathlib import Path
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from app.config import ENV, OLLAMA_URL, OLLAMA_MODEL, VLLM_URL, VLLM_MODEL, MONGODB_URL, GCS_BUCKET
@@ -61,6 +64,65 @@ async def get_active_adapter(customer_id: str) -> Optional[dict]:
 
 # Local adapters directory on the inference VM
 ADAPTERS_DIR = "/home/jacobrafati/adapters"
+
+
+def download_adapter_from_gcs(gcs_path: str, local_path: str) -> bool:
+    """Download adapter from GCS to local path if not already present"""
+    # Check if adapter already exists locally
+    config_file = Path(local_path) / "adapter_config.json"
+    if config_file.exists():
+        print(f"[INFERENCE] Adapter already exists at {local_path}")
+        return True
+
+    # Create directory
+    Path(local_path).mkdir(parents=True, exist_ok=True)
+
+    try:
+        print(f"[INFERENCE] Downloading adapter from {gcs_path} to {local_path}")
+        result = subprocess.run(
+            ["gsutil", "-m", "cp", "-r", f"{gcs_path}/*", local_path],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        if result.returncode == 0:
+            print(f"[INFERENCE] Adapter downloaded successfully")
+            return True
+        else:
+            print(f"[INFERENCE] GCS download failed: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"[INFERENCE] Error downloading adapter: {e}")
+        return False
+
+
+def get_adapter_local_path(adapter: dict) -> Optional[str]:
+    """Get or download the adapter, return local path"""
+    customer_id = adapter.get("customer_id")
+    job_id = adapter.get("job_id")
+    gcs_url = adapter.get("gcs_url", "")
+
+    # Local path for this adapter
+    local_path = f"{ADAPTERS_DIR}/{customer_id}/adapter"
+
+    # If GCS path provided (starts with gs://), download if needed
+    if gcs_url.startswith("gs://"):
+        if download_adapter_from_gcs(gcs_url, local_path):
+            return local_path
+        return None
+
+    # Try constructing GCS path from bucket and customer/job
+    if GCS_BUCKET and job_id:
+        gcs_path = f"gs://{GCS_BUCKET}/{customer_id}/adapter_{job_id}"
+        if download_adapter_from_gcs(gcs_path, local_path):
+            return local_path
+
+    # Check if local path exists
+    if Path(local_path).exists() and (Path(local_path) / "adapter_config.json").exists():
+        return local_path
+
+    print(f"[INFERENCE] No adapter found for customer {customer_id}")
+    return None
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -186,10 +248,11 @@ async def generate(request: GenerateRequest):
     adapter_path = None
     if request.customer_id and info["backend"] == "vllm":
         adapter = await get_active_adapter(request.customer_id)
-        if adapter and adapter.get("gcs_path"):
-            # Construct local adapter path - vLLM loads it automatically
-            adapter_path = f"{ADAPTERS_DIR}/{request.customer_id}/adapter"
-            print(f"[INFERENCE] Customer {request.customer_id} has active adapter at {adapter_path}")
+        if adapter:
+            # Get or download the adapter, returns local path
+            adapter_path = get_adapter_local_path(adapter)
+            if adapter_path:
+                print(f"[INFERENCE] Customer {request.customer_id} using adapter at {adapter_path}")
 
     try:
         if info["backend"] == "ollama":
